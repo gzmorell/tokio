@@ -1,75 +1,46 @@
-//! A "print-each-packet" server with Tokio
+//! A chat server that broadcasts a message to all connections.
 //!
-//! This server will create a TCP listener, accept connections in a loop, and
-//! put down in the stdout everything that's read off of each TCP connection.
+//! This example is explicitly more verbose than it has to be. This is to
+//! illustrate more concepts.
 //!
-//! Because the Tokio runtime uses a thread pool, each TCP connection is
-//! processed concurrently with all other TCP connections across multiple
-//! threads.
+//! A chat server for telnet clients. After a telnet client connects, the first
+//! line should contain the client's name. After that, all lines sent by a
+//! client are broadcasted to all other connected clients.
 //!
-//! To see this server in action, you can run this in one terminal:
+//! Because the client is telnet, lines are delimited by "\r\n".
 //!
-//!     cargo run --example print\_each\_packet
+//! You can test this out by running:
 //!
-//! and in another terminal you can run:
+//!     cargo run --example chat
 //!
-//!     cargo run --example connect 127.0.0.1:8080
+//! And then in another terminal run:
 //!
-//! Each line you type in to the `connect` terminal should be written to terminal!
+//!     telnet localhost 6142
 //!
-//! Minimal js example:
+//! You can run the `telnet` command in any number of additional windows.
 //!
-//! ```js
-//! var net = require("net");
-//!
-//! var listenPort = 8080;
-//!
-//! var server = net.createServer(function (socket) {
-//!     socket.on("data", function (bytes) {
-//!         console.log("bytes", bytes);
-//!     });
-//!
-//!     socket.on("end", function() {
-//!         console.log("Socket received FIN packet and closed connection");
-//!     });
-//!     socket.on("error", function (error) {
-//!         console.log("Socket closed with error", error);
-//!     });
-//!
-//!     socket.on("close", function (with_error) {
-//!         if (with_error) {
-//!             console.log("Socket closed with result: Err(SomeError)");
-//!         } else {
-//!             console.log("Socket closed with result: Ok(())");
-//!         }
-//!     });
-//!
-//! });
-//!
-//! server.listen(listenPort);
-//!
-//! console.log("Listening on:", listenPort);
-//! ```
-//!
+//! You can run the second command in multiple windows and then chat between the
+//! two, seeing the messages from the other client as they're received. For all
+//! connected clients they'll all join the same room and see everyone else's
+//! messages.
 
 #![warn(rust_2018_idioms)]
 
 use bytes::BytesMut;
 use futures::SinkExt;
-use tokio::net::{TcpListener, TcpStream};
+use std::collections::HashMap;
+use std::error::Error;
+use std::io;
+//use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::net::TcpStream;
+use tokio::net::TcpListener;
+use tokio::sync::{mpsc, Mutex};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{BytesCodec, Framed};
-use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
-use std::net::SocketAddr;
-use std::error::Error;
-use std::collections::HashMap;
-use std::io;
-
-
-
-
 use std::env;
+use stubborn_io::StubbornTcpStream;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -83,7 +54,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // Traces emitted by the example code will always be displayed. You
         // can set `RUST_LOG=tokio=trace` to enable additional traces emitted by
         // Tokio itself.
-        .with_env_filter(EnvFilter::from_default_env().add_directive("chat=info".parse()?))
+        .with_env_filter(EnvFilter::from_default_env().add_directive("tcp_dump=info".parse()?))
         // Log events when `tracing` spans are created, entered, exited, or
         // closed. When Tokio's internal tracing support is enabled (as
         // described above), this can be used to track the lifecycle of spawned
@@ -98,30 +69,47 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // The server task will hold a handle to this. For every new client, the
     // `state` handle is cloned and passed into the task that processes the
     // client connection.
-    let state = Arc::new(Mutex::new(Shared::new()));
-
+    
     let addr = env::args()
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:6142".to_string());
+
+    let server = env::args()
+    .nth(2)
+    .unwrap_or_else(|| "127.0.0.1:6140".to_string());
+
+    let server_address = server.parse::<SocketAddr>()?;
+
+    let state = Arc::new(Mutex::new(Shared::new()));
+    let server_state = Arc::clone(&state);
+    let client_stream = StubbornTcpStream::connect(server_address).await.unwrap();
+    tracing::info!("Connected to Server");
+    tokio::spawn(async move {
+        tracing::info!("Accepted connection");
+        if let Err(e) = process(server_state, *client_stream, server_address).await {
+            tracing::info!("an error occurred; error = {:?}", e);
+        }
+    });
 
     // Bind a TCP listener to the socket address.
     //
     // Note that this is the Tokio TcpListener, which is fully async.
     let listener = TcpListener::bind(&addr).await?;
-    
 
     tracing::info!("server running on {}", addr);
 
     loop {
-        // Asynchronously wait for an inbound TcpStream.
+        
         let (stream, addr) = listener.accept().await?;
-
+        tracing::info!("Connected to Server");
+        let client_stream = TcpStream::connect(server_address).await?;
+        // Asynchronously wait for an inbound TcpStream.
         // Clone a handle to the `Shared` state for the new connection.
         let state = Arc::clone(&state);
 
         // Spawn our handler to be run asynchronously.
         tokio::spawn(async move {
-            tracing::debug!("accepted connection");
+            tracing::info!("Accepted connection");
             if let Err(e) = process(state, stream, addr).await {
                 tracing::info!("an error occurred; error = {:?}", e);
             }
@@ -129,7 +117,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-
+/// Shorthand for the transmit half of the message channel.
 type Tx = mpsc::UnboundedSender<BytesMut>;
 
 /// Shorthand for the receive half of the message channel.
@@ -159,12 +147,17 @@ impl Shared {
         for peer in self.peers.iter_mut() {
             if *peer.0 != sender {
                 let _ = peer.1.send(message.to_owned());
+                println!(
+                    "Peer {} command received: {:?}",
+                    peer.0.to_string(),
+                    message
+                );
             }
         }
     }
 }
 
-struct Peer {
+struct Connection {
     /// The TCP socket wrapped with the `Lines` codec, defined below.
     ///
     /// This handles sending and receiving data on the socket. When using
@@ -179,12 +172,12 @@ struct Peer {
     rx: Rx,
 }
 
-impl Peer {
+impl Connection {
     /// Create a new instance of `Peer`.
     async fn new(
         state: Arc<Mutex<Shared>>,
         bytes: Framed<TcpStream, BytesCodec>,
-    ) -> io::Result<Peer> {
+    ) -> io::Result<Connection> {
         // Get the client socket address
         let addr = bytes.get_ref().peer_addr()?;
 
@@ -194,7 +187,7 @@ impl Peer {
         // Add an entry for this `Peer` in the shared state map.
         state.lock().await.peers.insert(addr, tx);
 
-        Ok(Peer { bytes, rx })
+        Ok(Connection { bytes, rx })
     }
 }
 
@@ -203,30 +196,31 @@ async fn process(
     stream: TcpStream,
     addr: SocketAddr,
 ) -> Result<(), Box<dyn Error>> {
-    let mut bytes = Framed::new(stream, BytesCodec::new());
+    let bytes = Framed::new(stream, BytesCodec::new());
 
-    // Register our peer with state which internally sets up some channels.
-    let mut peer = Peer::new(state.clone(), bytes).await?;
+    // Register our connection with state which internally sets up some channels.
+    let mut connection = Connection::new(state.clone(), bytes).await?;
 
     // Process incoming messages until our stream is exhausted by a disconnect.
     loop {
         tokio::select! {
             // A message was received from a peer. Send it to the current user.
-            Some(msg) = peer.rx.recv() => {
-                peer.bytes.send(msg).await?;
-            }
-            result = peer.bytes.next() => match result {
+            something = connection.rx.recv() =>  match something {
+                    Some(msg) => connection.bytes.send(msg).await?,
+                    None => tracing::info!("connection {:?} broken?", connection.bytes.get_ref().peer_addr())
+            },
+
+            result = connection.bytes.next() => match result {
                 // A message was received from the current user, we should
                 // broadcast this message to the other users.
                 Some(Ok(msg)) => {
                     let mut state = state.lock().await;
-
                     state.broadcast(addr, &msg).await;
                 }
                 // An error occurred.
                 Some(Err(e)) => {
-                    tracing::error!(
-                        "an error occurred while processing messages for ; error = {:?}",
+                    tracing::info!(
+                        "An error occurred while processing messages, error = {:?}",
                         e
                     );
                 }
@@ -239,8 +233,11 @@ async fn process(
     // If this section is reached it means that the client was disconnected!
     // Let's let everyone still connected know about it.
     {
+        tracing::info!("Connection to be removed");
         let mut state = state.lock().await;
         state.peers.remove(&addr);
+        let msg = format!("{} has left the chat", &addr);
+        tracing::info!("{}", msg);
     }
 
     Ok(())
