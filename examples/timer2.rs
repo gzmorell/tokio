@@ -1,5 +1,4 @@
 use tokio::time;
-use std::time::{Instant};
 
 async fn task_that_takes_a_second() {
     println!("hello");
@@ -9,10 +8,17 @@ async fn task_that_takes_a_second() {
 #[tokio::main]
 async fn main() {
     let mut interval = time::interval(time::Duration::from_secs(2));
-    let start = Instant::now();
+    let mut count = 0;
     loop {
-    tokio::select! {
-        t = interval.tick() => task_that_takes_a_second(),
+        tokio::select! {
+            _ = interval.tick() => {
+                count += 1;
+                if count >= 10 {
+                    break
+                } else {
+                    task_that_takes_a_second().await
+                }
+             }
+        }
     }
-}
 }
