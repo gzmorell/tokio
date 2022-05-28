@@ -31,12 +31,11 @@ use futures::SinkExt;
 use std::collections::HashMap;
 use std::error::Error;
 use std::io;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex, broadcast};
+use tokio::sync::{mpsc, Mutex};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{BytesCodec, Framed};
 use std::env;
@@ -180,6 +179,7 @@ struct Connection {
     /// off of this `Rx`, it will be written to the socket.
     rx: Rx,
 
+    //// Transmission Half of the server channel
     stx: Tx,
 }
 
@@ -213,7 +213,7 @@ async fn process(
     let bytes = Framed::new(stream, BytesCodec::new());
 
     // Register our connection with state which internally sets up some channels.
-    let mut connection = Connection::new(state.clone(), bytes, stx.clone()).await?;
+    let mut connection = Connection::new(state.clone(), bytes, stx).await?;
 
     // Process incoming messages until our stream is exhausted by a disconnect.
     loop {
@@ -230,7 +230,7 @@ async fn process(
                 Some(Ok(msg)) => {
                     let mut state = state.lock().await;
                     state.broadcast(addr, &msg).await;
-                    stx.send(msg).unwrap();
+                    connection.stx.send(msg).unwrap();
                 }
                 // An error occurred.
                 Some(Err(e)) => {
