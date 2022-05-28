@@ -7,10 +7,10 @@ edition = "2021"
 # If you copy one of the examples into a new project, you should be using
 # [dependencies] instead, and delete the **path**.
 [dev-dependencies]
-tokio = { version = "1.0.0", path = "../tokio", features = ["full", "tracing"] }
-tokio-util = { version = "0.7.0", path = "../tokio-util", features = ["full"] }
-tokio-stream = { version = "0.1", path = "../tokio-stream" }
-stubborn-io = "0.3"
+tokio = { version = "1", features = ["full", "tracing"] }
+tokio-util = { version = "0.7.0", features = ["full"] }
+tokio-stream = { version = "0.1" }
+stubborn-io = { git = "https://github.com/gzmorell/stubborn-io", branch = "next" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.1", default-features = false, features = ["fmt", "ansi", "env-filter", "tracing-log"] }
 bytes = "1.0.0"
@@ -95,3 +95,11 @@ path = "named-pipe-multi-client.rs"
 [[example]]
 name = "tcp_dump"
 path = "tcp_dump.rs"
+
+[[example]]
+name = "timer"
+path = "timer.rs"
+
+[[example]]
+name = "timer2"
+path = "timer2.rs"

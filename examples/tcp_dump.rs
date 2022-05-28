@@ -31,16 +31,19 @@ use futures::SinkExt;
 use std::collections::HashMap;
 use std::error::Error;
 use std::io;
-//use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, broadcast};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{BytesCodec, Framed};
 use std::env;
 use stubborn_io::StubbornTcpStream;
+use stubborn_io::ReconnectOptions;
+
+
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -79,17 +82,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .unwrap_or_else(|| "127.0.0.1:6140".to_string());
 
     let server_address = server.parse::<SocketAddr>()?;
+    let options = ReconnectOptions::new().with_exit_if_first_connect_fails(false);
+    let client_stream = StubbornTcpStream::connect_with_options(server_address, options).await?;
+    tracing::info!("Connected to Server");
 
     let state = Arc::new(Mutex::new(Shared::new()));
-    let server_state = Arc::clone(&state);
-    let client_stream = StubbornTcpStream::connect(server_address).await.unwrap();
-    tracing::info!("Connected to Server");
-    tokio::spawn(async move {
-        tracing::info!("Accepted connection");
-        if let Err(e) = process(server_state, *client_stream, server_address).await {
-            tracing::info!("an error occurred; error = {:?}", e);
-        }
-    });
 
     // Bind a TCP listener to the socket address.
     //
@@ -97,20 +94,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind(&addr).await?;
 
     tracing::info!("server running on {}", addr);
+    let st = Arc::clone(&state);
+
+    let (stx, srx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        tracing::info!("Server connection process");
+        if let Err(e) = process_server_connection(st, client_stream, server_address, srx).await {
+            tracing::info!("an error occurred; error = {:?}", e);
+        }
+    });
+    
 
     loop {
         
         let (stream, addr) = listener.accept().await?;
         tracing::info!("Connected to Server");
-        let client_stream = TcpStream::connect(server_address).await?;
         // Asynchronously wait for an inbound TcpStream.
         // Clone a handle to the `Shared` state for the new connection.
         let state = Arc::clone(&state);
+        let stx2 = stx.clone();
 
         // Spawn our handler to be run asynchronously.
         tokio::spawn(async move {
             tracing::info!("Accepted connection");
-            if let Err(e) = process(state, stream, addr).await {
+            if let Err(e) = process(state, stream, addr, stx2).await {
                 tracing::info!("an error occurred; error = {:?}", e);
             }
         });
@@ -122,6 +129,8 @@ type Tx = mpsc::UnboundedSender<BytesMut>;
 
 /// Shorthand for the receive half of the message channel.
 type Rx = mpsc::UnboundedReceiver<BytesMut>;
+
+
 
 /// Data that is shared between all peers in the chat server.
 ///
@@ -170,6 +179,8 @@ struct Connection {
     /// This is used to receive messages from peers. When a message is received
     /// off of this `Rx`, it will be written to the socket.
     rx: Rx,
+
+    stx: Tx,
 }
 
 impl Connection {
@@ -177,6 +188,8 @@ impl Connection {
     async fn new(
         state: Arc<Mutex<Shared>>,
         bytes: Framed<TcpStream, BytesCodec>,
+        stx: Tx,
+        
     ) -> io::Result<Connection> {
         // Get the client socket address
         let addr = bytes.get_ref().peer_addr()?;
@@ -187,7 +200,7 @@ impl Connection {
         // Add an entry for this `Peer` in the shared state map.
         state.lock().await.peers.insert(addr, tx);
 
-        Ok(Connection { bytes, rx })
+        Ok(Connection { bytes, rx, stx })
     }
 }
 
@@ -195,11 +208,12 @@ async fn process(
     state: Arc<Mutex<Shared>>,
     stream: TcpStream,
     addr: SocketAddr,
+    stx: Tx,
 ) -> Result<(), Box<dyn Error>> {
     let bytes = Framed::new(stream, BytesCodec::new());
 
     // Register our connection with state which internally sets up some channels.
-    let mut connection = Connection::new(state.clone(), bytes).await?;
+    let mut connection = Connection::new(state.clone(), bytes, stx.clone()).await?;
 
     // Process incoming messages until our stream is exhausted by a disconnect.
     loop {
@@ -216,6 +230,7 @@ async fn process(
                 Some(Ok(msg)) => {
                     let mut state = state.lock().await;
                     state.broadcast(addr, &msg).await;
+                    stx.send(msg).unwrap();
                 }
                 // An error occurred.
                 Some(Err(e)) => {
@@ -242,3 +257,51 @@ async fn process(
 
     Ok(())
 }
+
+async fn process_server_connection(
+    state: Arc<Mutex<Shared>>,
+    stream: StubbornTcpStream<SocketAddr>,
+    addr: SocketAddr,
+    mut srx: Rx,
+) -> Result<(), Box<dyn Error>> {
+    let mut bytes = Framed::new(stream, BytesCodec::new());
+
+    // Process incoming messages until our stream is exhausted by a disconnect.
+    loop {
+        tokio::select! {
+            // A message was received from a peer. Send it to the current user.
+            
+            result = bytes.next() => match result {
+                // A message was received from the current user, we should
+                // broadcast this message to the other users.
+                Some(Ok(msg)) => {
+                    let mut state = state.lock().await;
+                    state.broadcast(addr, &msg).await;
+                }
+                // An error occurred.
+                Some(Err(e)) => {
+                    tracing::info!(
+                        "An error occurred while processing messages, error = {:?}",
+                        e
+                    );
+                }
+                // The stream has been exhausted.
+                None => break,
+            },
+            something = srx.recv() => { match something {
+                Some(msg) => bytes.send(msg).await?,
+                    None => tracing::info!("Something bad"),
+            }
+            }
+        }
+    }
+
+    // If this section is reached it means that the client was disconnected!
+    // Let's let everyone still connected know about it.
+    {
+        tracing::info!("Server broken");
+    }
+
+    Ok(())
+}
+
