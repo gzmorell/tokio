@@ -103,3 +103,8 @@ path = "timer.rs"
 [[example]]
 name = "timer2"
 path = "timer2.rs"
+
+[[example]]
+name = "limited-server"
+path = "limited-server.rs"
+
